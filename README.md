@@ -44,7 +44,7 @@ claude-provider interactive
 
 ## how it works
 
-each provider is stored as a json file in `~/.claude/providers/`. when you run `claude-provider use`, it temporarily modifies `~/.claude/settings.json` with the provider's configuration, runs claude, then restores the original settings.
+each provider is stored as a file in `~/.claude/{provider}.json`. when you run `claude-provider use`, it temporarily modifies `~/.claude/settings.json` with the provider's configuration, runs claude, then restores the original settings.
 
 ## zsh integration
 
