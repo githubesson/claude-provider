@@ -1,6 +1,11 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::{
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, is_raw_mode_enabled, Clear, ClearType},
+    event::{self, Event, KeyCode},
+    cursor::{Hide, Show, MoveTo, EnableBlinking, DisableBlinking},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
@@ -68,7 +73,35 @@ fn ensure_providers_dir() -> Result<PathBuf> {
 }
 
 fn clear_screen() {
-    print!("\x1B[2J\x1B[H");
+    let mut stdout = io::stdout();
+    
+    let _ = execute!(stdout, Clear(ClearType::All));
+    let _ = execute!(stdout, MoveTo(0, 0));
+    stdout.flush().unwrap();
+}
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn new() -> Result<Self> {
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        let _ = execute!(stdout, Hide);
+        let _ = execute!(stdout, EnableBlinking);
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let mut stdout = io::stdout();
+        let _ = execute!(stdout, Show);
+        let _ = execute!(stdout, DisableBlinking);
+        if is_raw_mode_enabled().unwrap_or(false) {
+            disable_raw_mode().ok();
+        }
+        stdout.flush().unwrap();
+    }
 }
 
 fn prompt_input(prompt: &str) -> Result<String> {
@@ -78,6 +111,82 @@ fn prompt_input(prompt: &str) -> Result<String> {
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     Ok(input.trim().to_string())
+}
+
+fn wait_for_key() {
+    let mut stdout = io::stdout();
+    let _ = execute!(stdout, Show);
+    let _ = execute!(stdout, DisableBlinking);
+    print!("  Press Enter to continue...");
+    io::stdout().flush().unwrap();
+
+    
+    let mut input = String::new();
+    let _ = io::stdin().read_line(&mut input);
+
+    let _ = execute!(stdout, Hide);
+}
+
+fn draw_menu_with_arrows(options: &[&str], title: &str) -> usize {
+    let mut selected = 0;
+
+    loop {
+        clear_screen();
+
+        
+        let mut stdout = io::stdout();
+        execute!(stdout, MoveTo(0, 0)).unwrap();
+        let lines = [
+            "╔══════════════════════════════════════════════════════════╗",
+            &format!("║ {:^56} ║", title),
+            "╚══════════════════════════════════════════════════════════╝",
+            "",
+        ];
+        for (i, line) in lines.iter().enumerate() {
+            execute!(stdout, MoveTo(0, i as u16)).unwrap();
+            execute!(stdout, Clear(ClearType::UntilNewLine)).unwrap();
+            println!("{}", line);
+        }
+        stdout.flush().unwrap();
+
+        
+        for (i, opt) in options.iter().enumerate() {
+            let marker = if i == selected { ">" } else { " " };
+            let y = i as u16 + 6;
+            execute!(stdout, MoveTo(0, y)).unwrap();
+            execute!(stdout, Clear(ClearType::UntilNewLine)).unwrap();
+            println!("  {}  {}", marker, opt);
+        }
+
+        
+        let y = (options.len() as u16) + 8;
+        execute!(stdout, MoveTo(0, y)).unwrap();
+        execute!(stdout, Clear(ClearType::UntilNewLine)).unwrap();
+        print!("  Use ↑/↓ arrows to navigate, Enter to select, Esc to go back");
+        stdout.flush().unwrap();
+
+        if let Ok(Event::Key(key)) = event::read() {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if selected > 0 {
+                        selected -= 1;
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if selected < options.len() - 1 {
+                        selected += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    return selected;
+                }
+                KeyCode::Esc => {
+                    return options.len(); 
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 fn prompt_password(prompt: &str) -> Result<String> {
@@ -181,14 +290,6 @@ fn append_provider_function(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn print_header(title: &str) {
-    println!();
-    println!("╔══════════════════════════════════════════════════════════╗");
-    println!("║ {:^56} ║", title);
-    println!("╚══════════════════════════════════════════════════════════╝");
-    println!();
-}
-
 fn list_providers() -> Result<Vec<String>> {
     let dir = ensure_providers_dir()?;
     let mut providers = Vec::new();
@@ -204,29 +305,6 @@ fn list_providers() -> Result<Vec<String>> {
 
     providers.sort();
     Ok(providers)
-}
-
-fn draw_menu(options: &[&str], title: &str) -> usize {
-    loop {
-        clear_screen();
-        print_header(title);
-
-        for (i, opt) in options.iter().enumerate() {
-            println!("  {}. {}", i + 1, opt);
-        }
-
-        println!();
-        print!("Enter choice (1-{}): ", options.len());
-        io::stdout().flush().unwrap();
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).unwrap();
-        let input: usize = input.trim().parse().ok().unwrap_or(0);
-
-        if input >= 1 && input <= options.len() {
-            return input - 1;
-        }
-    }
 }
 
 fn setup_provider_interactive() -> Result<()> {
@@ -294,17 +372,20 @@ fn remove_provider_interactive() -> Result<()> {
     let providers = list_providers()?;
 
     if providers.is_empty() {
-        println!();
-        println!("  No providers configured.");
-        println!();
-        print!("  Press Enter to continue...");
-        io::stdout().flush().unwrap();
-        let _ = io::stdin().read_line(&mut String::new());
+        clear_screen();
+        let mut stdout = io::stdout();
+        execute!(stdout, MoveTo(0, 0)).unwrap();
+        print!("\n  No providers configured.\n");
+        wait_for_key();
         return Ok(());
     }
 
     let options: Vec<&str> = providers.iter().map(|s| s.as_str()).collect();
-    let idx = draw_menu(&options, "Remove Provider");
+    let idx = draw_menu_with_arrows(&options, "Remove Provider");
+
+    if idx >= providers.len() {
+        return Ok(());
+    }
 
     let provider_name = &providers[idx];
     let providers_dir = ensure_providers_dir()?;
@@ -314,12 +395,11 @@ fn remove_provider_interactive() -> Result<()> {
 
     remove_provider_function(provider_name)?;
 
-    println!();
-    println!("  ✓ Provider '{}' removed.", provider_name);
-    println!();
-    print!("  Press Enter to continue...");
-    io::stdout().flush().unwrap();
-    let _ = io::stdin().read_line(&mut String::new());
+    clear_screen();
+    let mut stdout = io::stdout();
+    execute!(stdout, MoveTo(0, 0)).unwrap();
+    print!("\n  Provider '{}' removed.\n", provider_name);
+    wait_for_key();
 
     Ok(())
 }
@@ -464,7 +544,14 @@ fn main() -> Result<()> {
             result?;
         }
         Commands::Interactive => {
-            enable_raw_mode().context("Failed to enable raw mode")?;
+            clear_screen();
+            let mut _raw_guard = match RawModeGuard::new() {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("Failed to enable raw mode: {:#}", e);
+                    return Err(e);
+                }
+            };
 
             loop {
                 let options = vec![
@@ -473,36 +560,54 @@ fn main() -> Result<()> {
                     "List providers",
                     "Exit",
                 ];
-                let choice = draw_menu(&options, "Claude Provider Manager");
+                let choice = draw_menu_with_arrows(&options, "Claude Provider Manager");
 
                 match choice {
                     0 => {
-                        disable_raw_mode().ok();
+                        drop(_raw_guard);
                         if let Err(e) = setup_provider_interactive() {
                             eprintln!("Error: {:#}", e);
+                            wait_for_key();
                         }
-                        enable_raw_mode().ok();
+                        _raw_guard = match RawModeGuard::new() {
+                            Ok(g) => g,
+                            Err(e) => {
+                                eprintln!("Failed to restore raw mode: {:#}", e);
+                                return Err(e);
+                            }
+                        };
                     }
                     1 => {
-                        disable_raw_mode().ok();
+                        drop(_raw_guard);
                         if let Err(e) = remove_provider_interactive() {
                             eprintln!("Error: {:#}", e);
+                            wait_for_key();
                         }
-                        enable_raw_mode().ok();
+                        _raw_guard = match RawModeGuard::new() {
+                            Ok(g) => g,
+                            Err(e) => {
+                                eprintln!("Failed to restore raw mode: {:#}", e);
+                                return Err(e);
+                            }
+                        };
                     }
                     2 => {
-                        disable_raw_mode().ok();
+                        drop(_raw_guard);
                         let _ = list_providers_command();
-                        print!("  Press Enter to continue...");
-                        io::stdout().flush().unwrap();
-                        let _ = io::stdin().read_line(&mut String::new());
-                        enable_raw_mode().ok();
+                        wait_for_key();
+                        _raw_guard = match RawModeGuard::new() {
+                            Ok(g) => g,
+                            Err(e) => {
+                                eprintln!("Failed to restore raw mode: {:#}", e);
+                                return Err(e);
+                            }
+                        };
                     }
-                    3 => {
-                        disable_raw_mode().ok();
+                    3 | _ => {
+                        drop(_raw_guard);
+                        clear_screen();
                         break;
                     }
-                    _ => {}
                 }
             }
         }
