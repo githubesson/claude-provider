@@ -16,6 +16,56 @@ use std::process::Command;
 const PROVIDERS_DIR: &str = "providers";
 const SETTINGS_FILE: &str = "settings.json";
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Shell {
+    Bash,
+    Zsh,
+}
+
+fn detect_shell() -> Shell {
+    std::env::var("SHELL")
+        .ok()
+        .and_then(|s| {
+            if s.contains("zsh") {
+                Some(Shell::Zsh)
+            } else if s.contains("bash") {
+                Some(Shell::Bash)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| {
+            // Fallback: check TERM to help determine shell
+            match std::env::var("TERM").as_deref() {
+                Ok(_) => Shell::Zsh, // Default to zsh as fallback when in terminal
+                Err(_) => Shell::Zsh,
+            }
+        })
+}
+
+impl Shell {
+    fn func_file_name(&self) -> &str {
+        match self {
+            Shell::Bash => "provider-functions.bash",
+            Shell::Zsh => "provider-functions.zsh",
+        }
+    }
+
+    fn rc_file_name(&self) -> &str {
+        match self {
+            Shell::Bash => ".bashrc",
+            Shell::Zsh => ".zshrc",
+        }
+    }
+
+    fn source_command(&self, path: &std::path::Path) -> String {
+        match self {
+            Shell::Bash => format!("source {}", path.display()),
+            Shell::Zsh => format!("source {}", path.display()),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Default, Debug)]
 struct EnvSettings {
     #[serde(alias = "anthropic_base_url")]
@@ -193,15 +243,12 @@ fn prompt_password(prompt: &str) -> Result<String> {
     prompt_input(prompt)
 }
 
-fn remove_provider_function(provider_name: &str) -> Result<()> {
-    let config_dir = get_config_dir()?;
-    let zsh_func_path = config_dir.join("provider-functions.zsh");
-
-    if !zsh_func_path.exists() {
+fn remove_provider_function_from_file(func_path: &PathBuf, provider_name: &str) -> Result<()> {
+    if !func_path.exists() {
         return Ok(());
     }
 
-    let existing_funcs = fs::read_to_string(&zsh_func_path)?;
+    let existing_funcs = fs::read_to_string(func_path)?;
     let marker = format!("# Provider function for {}", provider_name);
     let mut cleaned_lines = Vec::new();
     let mut in_function_block = false;
@@ -222,16 +269,26 @@ fn remove_provider_function(provider_name: &str) -> Result<()> {
 
     let cleaned = cleaned_lines.join("\n").trim().to_string();
     if cleaned.is_empty() {
-        fs::remove_file(&zsh_func_path)?;
+        fs::remove_file(func_path)?;
     } else {
-        fs::write(&zsh_func_path, cleaned)?;
+        fs::write(func_path, cleaned)?;
     }
     Ok(())
 }
 
-fn append_provider_function(name: &str) -> Result<()> {
+fn remove_provider_function(provider_name: &str) -> Result<()> {
     let config_dir = get_config_dir()?;
-    let zsh_func_path = config_dir.join("provider-functions.zsh");
+    let shells = [Shell::Bash, Shell::Zsh];
+
+    for shell in &shells {
+        let func_path = config_dir.join(shell.func_file_name());
+        remove_provider_function_from_file(&func_path, provider_name)?;
+    }
+
+    Ok(())
+}
+
+fn append_provider_function_to_file(func_path: &PathBuf, rc_path: &PathBuf, name: &str, shell: Shell) -> Result<()> {
     let func_content = format!(
         r#"# Provider function for {name}
 {name}() {{
@@ -241,8 +298,8 @@ fn append_provider_function(name: &str) -> Result<()> {
         name = name
     );
 
-    let existing = if zsh_func_path.exists() {
-        fs::read_to_string(&zsh_func_path)?
+    let existing = if func_path.exists() {
+        fs::read_to_string(func_path)?
     } else {
         String::new()
     };
@@ -271,20 +328,32 @@ fn append_provider_function(name: &str) -> Result<()> {
         format!("{}\n\n{}", cleaned, func_content)
     };
 
-    fs::write(&zsh_func_path, new_content)?;
+    fs::write(func_path, new_content)?;
 
-    let zshrc_path = PathBuf::from(env!("HOME")).join(".zshrc");
-    let source_line = format!("source {}", zsh_func_path.display());
+    let source_line = shell.source_command(func_path);
 
-    if zshrc_path.exists() {
-        let zshrc_content = fs::read_to_string(&zshrc_path)?;
-        if !zshrc_content.contains(&source_line) {
-            fs::write(&zshrc_path, format!("{}\n{}\n", zshrc_content.trim(), source_line))?;
-            println!("  ✓ Added source line to ~/.zshrc");
+    if rc_path.exists() {
+        let rc_content = fs::read_to_string(rc_path)?;
+        if !rc_content.contains(&source_line) {
+            fs::write(rc_path, format!("{}\n{}\n", rc_content.trim(), source_line))?;
+            println!("  ✓ Added source line to ~/{}", shell.rc_file_name());
         }
     } else {
-        fs::write(&zshrc_path, format!("{}\n", source_line))?;
-        println!("  ✓ Created ~/.zshrc with source line");
+        fs::write(rc_path, format!("{}\n", source_line))?;
+        println!("  ✓ Created ~/{} with source line", shell.rc_file_name());
+    }
+
+    Ok(())
+}
+
+fn append_provider_function(name: &str) -> Result<()> {
+    let config_dir = get_config_dir()?;
+    let home = PathBuf::from(env!("HOME"));
+
+    for shell in [Shell::Bash, Shell::Zsh] {
+        let func_path = config_dir.join(shell.func_file_name());
+        let rc_path = home.join(shell.rc_file_name());
+        append_provider_function_to_file(&func_path, &rc_path, name, shell)?;
     }
 
     Ok(())
@@ -359,7 +428,7 @@ fn setup_provider_interactive() -> Result<()> {
 
     println!();
     println!("  ✓ Provider '{}' saved to {}", name, provider_path.display());
-    println!("  ✓ Zsh function created: '{}'", name);
+    println!("  ✓ Shell functions created for bash and zsh: '{}'", name);
     println!();
     print!("  Press Enter to continue...");
     io::stdout().flush().unwrap();
@@ -496,6 +565,17 @@ fn list_providers_command() -> Result<()> {
     Ok(())
 }
 
+fn detect_shell_command() -> Result<()> {
+    let shell = detect_shell();
+    println!();
+    match shell {
+        Shell::Bash => println!("  Detected shell: bash"),
+        Shell::Zsh => println!("  Detected shell: zsh"),
+    }
+    println!();
+    Ok(())
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "claude-provider")]
 #[command(author = "User")]
@@ -513,6 +593,8 @@ enum Commands {
     Remove,
 
     List,
+
+    Detect,
 
     Use {
         provider: String,
@@ -536,6 +618,9 @@ fn main() -> Result<()> {
         }
         Commands::List => {
             list_providers_command()?;
+        }
+        Commands::Detect => {
+            detect_shell_command()?;
         }
         Commands::Use { provider, args } => {
             enable_raw_mode().context("Failed to enable raw mode")?;
